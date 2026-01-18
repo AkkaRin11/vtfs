@@ -1,0 +1,4 @@
+CompileFlags:
+  Add: [-D__KERNEL__]
+Diagnostics:
+  Suppress: ["*"]

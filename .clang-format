@@ -1,0 +1,11 @@
+BasedOnStyle: LLVM
+IndentWidth: 8
+UseTab: Never
+TabWidth: 8
+ColumnLimit: 100
+AccessModifierOffset: -8
+AllowShortFunctionsOnASingleLine: None
+AlwaysBreakTemplateDeclarations: Yes
+BinPackArguments: false
+BinPackParameters: false
+BreakBeforeBraces: Linux
