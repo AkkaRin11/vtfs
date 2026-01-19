@@ -23,14 +23,25 @@ struct vtfs_file_content {
     size_t allocated;
 };
 
-struct vtfs_file_info {
+/* Directory entry: (name in parent dir) -> ino */
+struct vtfs_dir_entry {
     char name[256];
     ino_t ino;
-    ino_t parent_ino;
+    struct list_head sibling_list; /* in parent->children */
+};
+
+struct vtfs_file_info {
+    ino_t ino;
     bool is_dir;
 
-    struct list_head all_list;
-    struct list_head sibling_list;
+    /* Number of hardlinks (directory entries) pointing to this inode.
+     * For dirs in this lab we keep it simple and don't create hardlinks.
+     */
+    unsigned int nlink;
+
+    struct list_head all_list;   /* global list */
+
+    /* Only for directories: list of struct vtfs_dir_entry */
     struct list_head children;
 
     struct vtfs_file_content content;
@@ -68,19 +79,34 @@ static struct vtfs_file_info *ram_find_by_ino(ino_t ino)
     return NULL;
 }
 
+static struct vtfs_dir_entry *ram_find_dirent(struct vtfs_file_info *parent, const char *name)
+{
+    struct vtfs_dir_entry *de;
+
+    if (!parent || !parent->is_dir)
+        return NULL;
+
+    list_for_each_entry(de, &parent->children, sibling_list) {
+        if (strcmp(de->name, name) == 0)
+            return de;
+    }
+    return NULL;
+}
+
 static struct vtfs_file_info *ram_find_in_dir(ino_t parent_ino, const char *name)
 {
-    struct vtfs_file_info *parent, *fi;
+    struct vtfs_file_info *parent;
+    struct vtfs_dir_entry *de;
 
     parent = ram_find_by_ino(parent_ino);
     if (!parent || !parent->is_dir)
         return NULL;
 
-    list_for_each_entry(fi, &parent->children, sibling_list) {
-        if (strcmp(fi->name, name) == 0)
-            return fi;
-    }
-    return NULL;
+    de = ram_find_dirent(parent, name);
+    if (!de)
+        return NULL;
+
+    return ram_find_by_ino(de->ino);
 }
 
 static bool ram_dir_empty(struct vtfs_file_info *dir)
@@ -107,13 +133,11 @@ static int ram_init_root(ino_t root_ino)
 
     mutex_init(&root->lock);
     INIT_LIST_HEAD(&root->all_list);
-    INIT_LIST_HEAD(&root->sibling_list);
     INIT_LIST_HEAD(&root->children);
 
     root->ino = root_ino;
-    root->parent_ino = root_ino;
     root->is_dir = true;
-    strscpy(root->name, "/", sizeof(root->name));
+    root->nlink = 1; /* not used much for dirs in this lab */
 
     list_add_tail(&root->all_list, &vtfs_all_files);
 
@@ -128,6 +152,7 @@ static int ram_create_file(ino_t parent_ino, const char *name, ino_t *out_ino)
 {
     struct vtfs_file_info *fi;
     struct vtfs_file_info *parent;
+    struct vtfs_dir_entry *de;
 
     mutex_lock(&vtfs_files_lock);
 
@@ -137,7 +162,7 @@ static int ram_create_file(ino_t parent_ino, const char *name, ino_t *out_ino)
         return -ENOTDIR;
     }
 
-    if (ram_find_in_dir(parent_ino, name)) {
+    if (ram_find_dirent(parent, name)) {
         mutex_unlock(&vtfs_files_lock);
         return -EEXIST;
     }
@@ -150,16 +175,24 @@ static int ram_create_file(ino_t parent_ino, const char *name, ino_t *out_ino)
 
     mutex_init(&fi->lock);
     INIT_LIST_HEAD(&fi->all_list);
-    INIT_LIST_HEAD(&fi->sibling_list);
     INIT_LIST_HEAD(&fi->children);
 
     fi->ino = vtfs_next_ino++;
-    fi->parent_ino = parent_ino;
     fi->is_dir = false;
-    strscpy(fi->name, name, sizeof(fi->name));
+    fi->nlink = 1;
+
+    de = kzalloc(sizeof(*de), GFP_KERNEL);
+    if (!de) {
+        kfree(fi);
+        mutex_unlock(&vtfs_files_lock);
+        return -ENOMEM;
+    }
+    INIT_LIST_HEAD(&de->sibling_list);
+    strscpy(de->name, name, sizeof(de->name));
+    de->ino = fi->ino;
 
     list_add_tail(&fi->all_list, &vtfs_all_files);
-    list_add_tail(&fi->sibling_list, &parent->children);
+    list_add_tail(&de->sibling_list, &parent->children);
 
     mutex_unlock(&vtfs_files_lock);
 
@@ -169,8 +202,8 @@ static int ram_create_file(ino_t parent_ino, const char *name, ino_t *out_ino)
 
 static int ram_unlink_file(ino_t parent_ino, const char *name)
 {
-    struct vtfs_file_info *fi;
-    struct vtfs_file_info *parent;
+    struct vtfs_file_info *parent, *fi;
+    struct vtfs_dir_entry *de;
 
     mutex_lock(&vtfs_files_lock);
 
@@ -180,8 +213,17 @@ static int ram_unlink_file(ino_t parent_ino, const char *name)
         return -ENOTDIR;
     }
 
-    fi = ram_find_in_dir(parent_ino, name);
+    de = ram_find_dirent(parent, name);
+    if (!de) {
+        mutex_unlock(&vtfs_files_lock);
+        return -ENOENT;
+    }
+
+    fi = ram_find_by_ino(de->ino);
     if (!fi) {
+        /* dangling entry shouldn't happen, but clean it */
+        list_del(&de->sibling_list);
+        kfree(de);
         mutex_unlock(&vtfs_files_lock);
         return -ENOENT;
     }
@@ -191,16 +233,25 @@ static int ram_unlink_file(ino_t parent_ino, const char *name)
         return -EISDIR;
     }
 
-    mutex_lock(&fi->lock);
-    kfree(fi->content.data);
-    fi->content.data = NULL;
-    fi->content.size = 0;
-    fi->content.allocated = 0;
-    mutex_unlock(&fi->lock);
+    /* remove directory entry */
+    list_del(&de->sibling_list);
+    kfree(de);
 
-    list_del(&fi->sibling_list);
-    list_del(&fi->all_list);
-    kfree(fi);
+    /* drop link count; free inode only when it reaches 0 */
+    if (fi->nlink > 0)
+        fi->nlink--;
+
+    if (fi->nlink == 0) {
+        mutex_lock(&fi->lock);
+        kfree(fi->content.data);
+        fi->content.data = NULL;
+        fi->content.size = 0;
+        fi->content.allocated = 0;
+        mutex_unlock(&fi->lock);
+
+        list_del(&fi->all_list);
+        kfree(fi);
+    }
 
     mutex_unlock(&vtfs_files_lock);
     return 0;
@@ -210,6 +261,7 @@ static int ram_mkdir(ino_t parent_ino, const char *name, ino_t *out_ino)
 {
     struct vtfs_file_info *fi;
     struct vtfs_file_info *parent;
+    struct vtfs_dir_entry *de;
 
     mutex_lock(&vtfs_files_lock);
 
@@ -219,7 +271,7 @@ static int ram_mkdir(ino_t parent_ino, const char *name, ino_t *out_ino)
         return -ENOTDIR;
     }
 
-    if (ram_find_in_dir(parent_ino, name)) {
+    if (ram_find_dirent(parent, name)) {
         mutex_unlock(&vtfs_files_lock);
         return -EEXIST;
     }
@@ -232,16 +284,24 @@ static int ram_mkdir(ino_t parent_ino, const char *name, ino_t *out_ino)
 
     mutex_init(&fi->lock);
     INIT_LIST_HEAD(&fi->all_list);
-    INIT_LIST_HEAD(&fi->sibling_list);
     INIT_LIST_HEAD(&fi->children);
 
     fi->ino = vtfs_next_ino++;
-    fi->parent_ino = parent_ino;
     fi->is_dir = true;
-    strscpy(fi->name, name, sizeof(fi->name));
+    fi->nlink = 1;
+
+    de = kzalloc(sizeof(*de), GFP_KERNEL);
+    if (!de) {
+        kfree(fi);
+        mutex_unlock(&vtfs_files_lock);
+        return -ENOMEM;
+    }
+    INIT_LIST_HEAD(&de->sibling_list);
+    strscpy(de->name, name, sizeof(de->name));
+    de->ino = fi->ino;
 
     list_add_tail(&fi->all_list, &vtfs_all_files);
-    list_add_tail(&fi->sibling_list, &parent->children);
+    list_add_tail(&de->sibling_list, &parent->children);
 
     mutex_unlock(&vtfs_files_lock);
 
@@ -251,8 +311,8 @@ static int ram_mkdir(ino_t parent_ino, const char *name, ino_t *out_ino)
 
 static int ram_rmdir(ino_t parent_ino, const char *name)
 {
-    struct vtfs_file_info *fi;
-    struct vtfs_file_info *parent;
+    struct vtfs_file_info *parent, *fi;
+    struct vtfs_dir_entry *de;
 
     mutex_lock(&vtfs_files_lock);
 
@@ -262,8 +322,16 @@ static int ram_rmdir(ino_t parent_ino, const char *name)
         return -ENOTDIR;
     }
 
-    fi = ram_find_in_dir(parent_ino, name);
+    de = ram_find_dirent(parent, name);
+    if (!de) {
+        mutex_unlock(&vtfs_files_lock);
+        return -ENOENT;
+    }
+
+    fi = ram_find_by_ino(de->ino);
     if (!fi) {
+        list_del(&de->sibling_list);
+        kfree(de);
         mutex_unlock(&vtfs_files_lock);
         return -ENOENT;
     }
@@ -278,7 +346,11 @@ static int ram_rmdir(ino_t parent_ino, const char *name)
         return -ENOTEMPTY;
     }
 
-    list_del(&fi->sibling_list);
+    /* remove entry from parent */
+    list_del(&de->sibling_list);
+    kfree(de);
+
+    /* remove inode */
     list_del(&fi->all_list);
     kfree(fi);
 
@@ -314,7 +386,7 @@ static ssize_t ram_read(ino_t ino, char __user *buf, size_t len, loff_t *ppos)
     }
 
     *ppos += len;
-    ret = len;
+    ret = (ssize_t)len;
 
 out:
     mutex_unlock(&fi->lock);
@@ -381,7 +453,6 @@ out:
     return ret;
 }
 
-
 static void ram_destroy_all(void)
 {
     struct vtfs_file_info *fi, *tmp;
@@ -389,13 +460,20 @@ static void ram_destroy_all(void)
     mutex_lock(&vtfs_files_lock);
 
     list_for_each_entry_safe(fi, tmp, &vtfs_all_files, all_list) {
+        /* free children direntries if directory */
+        if (fi->is_dir) {
+            struct vtfs_dir_entry *de, *de_tmp;
+            list_for_each_entry_safe(de, de_tmp, &fi->children, sibling_list) {
+                list_del(&de->sibling_list);
+                kfree(de);
+            }
+        }
+
         mutex_lock(&fi->lock);
         kfree(fi->content.data);
         mutex_unlock(&fi->lock);
 
         list_del(&fi->all_list);
-        if (!list_empty(&fi->sibling_list))
-            list_del(&fi->sibling_list);
         kfree(fi);
     }
 
@@ -424,6 +502,7 @@ static const struct vtfs_storage_ops *st = &ram_storage;
 static struct dentry *vtfs_lookup(struct inode *parent_inode, struct dentry *child_dentry, unsigned int flags);
 static int vtfs_create(struct mnt_idmap *idmap, struct inode *parent_inode,
                        struct dentry *child_dentry, umode_t mode, bool b);
+static int vtfs_link(struct dentry *old_dentry, struct inode *parent_dir, struct dentry *new_dentry);
 static int vtfs_unlink(struct inode *parent_inode, struct dentry *child_dentry);
 static struct dentry *vtfs_mkdir(struct mnt_idmap *idmap, struct inode *parent_inode,
                                  struct dentry *child_dentry, umode_t mode);
@@ -441,6 +520,7 @@ static int vtfs_getattr(struct mnt_idmap *idmap,
 static const struct inode_operations vtfs_inode_ops = {
     .lookup  = vtfs_lookup,
     .create  = vtfs_create,
+    .link    = vtfs_link,
     .unlink  = vtfs_unlink,
     .mkdir   = vtfs_mkdir,
     .rmdir   = vtfs_rmdir,
@@ -471,7 +551,7 @@ static int vtfs_iterate(struct file *filp, struct dir_context *ctx)
 {
     struct inode *inode = file_inode(filp);
     struct vtfs_file_info *dir_fi = inode->i_private;
-    struct vtfs_file_info *fi;
+    struct vtfs_dir_entry *de;
     loff_t idx;
 
     if (!dir_fi || !dir_fi->is_dir)
@@ -484,7 +564,8 @@ static int vtfs_iterate(struct file *filp, struct dir_context *ctx)
 
     mutex_lock(&vtfs_files_lock);
 
-    list_for_each_entry(fi, &dir_fi->children, sibling_list) {
+    list_for_each_entry(de, &dir_fi->children, sibling_list) {
+        struct vtfs_file_info *child_fi;
         unsigned char type;
         size_t nlen;
 
@@ -493,10 +574,14 @@ static int vtfs_iterate(struct file *filp, struct dir_context *ctx)
             continue;
         }
 
-        type = fi->is_dir ? DT_DIR : DT_REG;
-        nlen = strnlen(fi->name, sizeof(fi->name));
+        child_fi = ram_find_by_ino(de->ino);
+        if (!child_fi)
+            continue;
 
-        if (!dir_emit(ctx, fi->name, nlen, fi->ino, type))
+        type = child_fi->is_dir ? DT_DIR : DT_REG;
+        nlen = strnlen(de->name, sizeof(de->name));
+
+        if (!dir_emit(ctx, de->name, nlen, child_fi->ino, type))
             break;
 
         ctx->pos++;
@@ -533,7 +618,6 @@ static ssize_t vtfs_write(struct file *filp, const char __user *buf, size_t len,
     return ret;
 }
 
-
 static int vtfs_open(struct inode *inode, struct file *filp)
 {
     struct vtfs_file_info *fi = inode->i_private;
@@ -555,7 +639,6 @@ static int vtfs_open(struct inode *inode, struct file *filp)
 
     return 0;
 }
-
 
 static const struct file_operations vtfs_dir_ops = {
     .iterate_shared = vtfs_iterate,
@@ -633,6 +716,60 @@ static int vtfs_create(struct mnt_idmap *idmap, struct inode *parent_inode,
     inode->i_fop = &vtfs_file_ops;
 
     d_add(child_dentry, inode);
+    return 0;
+}
+
+static int vtfs_link(struct dentry *old_dentry, struct inode *parent_dir, struct dentry *new_dentry)
+{
+    struct inode *old_inode = d_inode(old_dentry);
+    struct vtfs_file_info *fi = old_inode ? old_inode->i_private : NULL;
+    struct vtfs_file_info *parent_fi = parent_dir->i_private;
+    struct vtfs_dir_entry *de;
+    struct inode *inode;
+
+    if (!fi)
+        return -ENOENT;
+
+    /* hardlink only for regular files */
+    if (fi->is_dir)
+        return -EPERM;
+
+    if (!parent_fi || !parent_fi->is_dir)
+        return -ENOTDIR;
+
+    if (new_dentry->d_name.len > NAME_MAX)
+        return -ENAMETOOLONG;
+
+    mutex_lock(&vtfs_files_lock);
+
+    if (ram_find_dirent(parent_fi, new_dentry->d_name.name)) {
+        mutex_unlock(&vtfs_files_lock);
+        return -EEXIST;
+    }
+
+    de = kzalloc(sizeof(*de), GFP_KERNEL);
+    if (!de) {
+        mutex_unlock(&vtfs_files_lock);
+        return -ENOMEM;
+    }
+
+    INIT_LIST_HEAD(&de->sibling_list);
+    strscpy(de->name, new_dentry->d_name.name, sizeof(de->name));
+    de->ino = fi->ino;
+
+    list_add_tail(&de->sibling_list, &parent_fi->children);
+    fi->nlink++;
+
+    mutex_unlock(&vtfs_files_lock);
+
+    inode = vtfs_make_inode(parent_dir->i_sb, S_IFREG | 0666, fi->ino, fi);
+    if (!inode)
+        return -ENOMEM;
+
+    inode->i_op  = &vtfs_inode_ops;
+    inode->i_fop = &vtfs_file_ops;
+
+    d_add(new_dentry, inode);
     return 0;
 }
 
