@@ -7,6 +7,7 @@
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
+#include <linux/uaccess.h>
 
 #define MODULE_NAME "vtfs"
 MODULE_LICENSE("GPL");
@@ -323,7 +324,7 @@ out:
 static ssize_t ram_write(ino_t ino, const char __user *buf, size_t len, loff_t *ppos)
 {
     struct vtfs_file_info *fi;
-    ssize_t ret;
+    ssize_t ret = 0;
     char *tmp;
 
     mutex_lock(&vtfs_files_lock);
@@ -346,18 +347,12 @@ static ssize_t ram_write(ino_t ino, const char __user *buf, size_t len, loff_t *
 
     mutex_lock(&fi->lock);
 
-    if (*ppos == 0) {
-        fi->content.size = 0;
-        if (fi->content.data)
-            memset(fi->content.data, 0, fi->content.allocated);
-    }
-
     if (*ppos + len > fi->content.allocated) {
-        size_t new_size = max(*ppos + len, fi->content.allocated * 2);
+        size_t new_size;
         char *new_data;
 
-        if (new_size == 0)
-            new_size = PAGE_SIZE;
+        new_size = max((size_t)(*ppos + len),
+                       fi->content.allocated ? fi->content.allocated * 2 : (size_t)PAGE_SIZE);
 
         new_data = krealloc(fi->content.data, new_size, GFP_KERNEL);
         if (!new_data) {
@@ -365,10 +360,8 @@ static ssize_t ram_write(ino_t ino, const char __user *buf, size_t len, loff_t *
             goto out;
         }
 
-        if (new_size > fi->content.allocated) {
-            memset(new_data + fi->content.allocated, 0,
-                   new_size - fi->content.allocated);
-        }
+        if (new_size > fi->content.allocated)
+            memset(new_data + fi->content.allocated, 0, new_size - fi->content.allocated);
 
         fi->content.data = new_data;
         fi->content.allocated = new_size;
@@ -380,13 +373,14 @@ static ssize_t ram_write(ino_t ino, const char __user *buf, size_t len, loff_t *
     if (*ppos > fi->content.size)
         fi->content.size = *ppos;
 
-    ret = len;
+    ret = (ssize_t)len;
 
 out:
     mutex_unlock(&fi->lock);
     kfree(tmp);
     return ret;
 }
+
 
 static void ram_destroy_all(void)
 {
@@ -520,11 +514,48 @@ static ssize_t vtfs_read(struct file *filp, char __user *buf, size_t len, loff_t
 static ssize_t vtfs_write(struct file *filp, const char __user *buf, size_t len, loff_t *ppos)
 {
     struct inode *inode = filp->f_inode;
-    ssize_t ret = st->write(inode->i_ino, buf, len, ppos);
-    if (ret > 0)
+    struct vtfs_file_info *fi = inode->i_private;
+    ssize_t ret;
+
+    if (fi && (filp->f_flags & O_APPEND)) {
+        mutex_lock(&fi->lock);
+        *ppos = fi->content.size;
+        mutex_unlock(&fi->lock);
+    }
+
+    ret = st->write(inode->i_ino, buf, len, ppos);
+
+    if (ret > 0) {
         inode_set_mtime_to_ts(inode, current_time(inode));
+        inode->i_size = max_t(loff_t, inode->i_size, *ppos);
+    }
+
     return ret;
 }
+
+
+static int vtfs_open(struct inode *inode, struct file *filp)
+{
+    struct vtfs_file_info *fi = inode->i_private;
+
+    if (!fi)
+        return 0;
+
+    if (fi->is_dir)
+        return 0;
+
+    if (filp->f_flags & O_TRUNC) {
+        mutex_lock(&fi->lock);
+        fi->content.size = 0;
+        mutex_unlock(&fi->lock);
+
+        inode->i_size = 0;
+        inode_set_mtime_to_ts(inode, current_time(inode));
+    }
+
+    return 0;
+}
+
 
 static const struct file_operations vtfs_dir_ops = {
     .iterate_shared = vtfs_iterate,
@@ -532,6 +563,7 @@ static const struct file_operations vtfs_dir_ops = {
 };
 
 static const struct file_operations vtfs_file_ops = {
+    .open   = vtfs_open,
     .read   = vtfs_read,
     .write  = vtfs_write,
     .llseek = generic_file_llseek,
